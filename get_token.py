@@ -82,6 +82,7 @@ def get_access_token(page, email):
         data = json.load(f) 
     SCOPES = data['oauth2']['Scopes']
     client_id = data['oauth2']['client_id']
+    client_secret = data['oauth2'].get('client_secret', '')
     redirect_url = data['oauth2']['redirect_url']
 
     code_verifier = generate_code_verifier()  
@@ -102,12 +103,28 @@ def get_access_token(page, email):
     captured_code = {}
 
     def on_request(request):
-        if request.url.startswith(redirect_url) and 'code=' in request.url:
-            query = parse_qs(urlsplit(request.url).query)
+        req_url = request.url
+        if redirect_url.rstrip('/') in req_url or req_url.startswith(redirect_url):
+            print(f"[OAuth2] 拦截到请求: {req_url[:100]}...")
+            query = parse_qs(urlsplit(req_url).query)
             if 'code' in query:
                 captured_code['code'] = query['code'][0]
+                print("[OAuth2] 成功捕获 auth code")
 
     page.on('request', on_request)
+
+    # 备选：通过帧导航事件捕获（某些重定向不触发 request 事件）
+    def on_frame_navigated(frame):
+        if frame == page.main_frame:
+            nav_url = frame.url
+            if redirect_url.rstrip('/') in nav_url or nav_url.startswith(redirect_url):
+                print(f"[OAuth2] 帧导航捕获: {nav_url[:100]}...")
+                query = parse_qs(urlsplit(nav_url).query)
+                if 'code' in query and 'code' not in captured_code:
+                    captured_code['code'] = query['code'][0]
+                    print("[OAuth2] 通过帧导航成功捕获 auth code")
+
+    page.on('framenavigated', on_frame_navigated)
 
     max_time = 2
     current_times = 0
@@ -121,6 +138,7 @@ def get_access_token(page, email):
             current_times = current_times + 1
             if current_times == max_time:
                 page.remove_listener('request', on_request)
+                page.remove_listener('framenavigated', on_frame_navigated)
                 return False, False, False
             continue
 
@@ -133,6 +151,7 @@ def get_access_token(page, email):
         page.wait_for_timeout(500)
 
     page.remove_listener('request', on_request)
+    page.remove_listener('framenavigated', on_frame_navigated)
 
     if 'code' not in captured_code:
         print(f"Authorization failed: No code captured. Current URL: {page.url}")
@@ -148,14 +167,17 @@ def get_access_token(page, email):
         'code_verifier': code_verifier,
         'scope': ' '.join(SCOPES)
     }
+    if client_secret:
+        token_data['client_secret'] = client_secret
 
     response = requests.post('https://login.microsoftonline.com/common/oauth2/v2.0/token', data=token_data, headers={
         'Content-Type': 'application/x-www-form-urlencoded'
     }, proxies=get_proxy())
 
-    if 'refresh_token' in response.json():
+    resp_json = response.json()
+    if 'refresh_token' in resp_json:
 
-        tokens = response.json()
+        tokens = resp_json
         token_data = {
             'refresh_token': tokens['refresh_token'],
             'access_token': tokens.get('access_token', ''),
@@ -167,5 +189,5 @@ def get_access_token(page, email):
         return refresh_token, access_token, expire_at
 
     else:
-
+        print(f"[OAuth2] Token 交换失败: {resp_json.get('error', 'unknown')} - {resp_json.get('error_description', '')}")
         return False, False, False
