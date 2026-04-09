@@ -20,11 +20,11 @@ def process_single_flow(controller):
     try:
         page = controller.get_thread_page()
 
-        email = random_email()
+        email, firstname, lastname = random_email()
         password = generate_strong_password()
 
         # 调用 controller 特定的注册方法
-        result = controller.outlook_register(page, email, password)
+        result = controller.outlook_register(page, email, password, firstname, lastname)
 
         if result and not controller.enable_oauth2:
             return True
@@ -74,7 +74,7 @@ def run_concurrent_flows(controller, concurrent_flows=10, max_tasks=100):
                 new_future = executor.submit(process_single_flow, controller)
                 running_futures.add(new_future)
                 task_counter += 1
-                if task_counter % (max_tasks // 2) == 0:
+                if max_tasks > 1 and task_counter % (max_tasks // 2) == 0:
                     print(f"已提交 {task_counter}/{max_tasks} 任务.")
 
             time.sleep(0.5)

@@ -16,7 +16,21 @@ class BaseBrowserController(ABC):
         self.wait_time = data['bot_protection_wait'] * 1000
         self.max_captcha_retries = data['max_captcha_retries']
         self.enable_oauth2 = data["oauth2"]['enable_oauth2']
-        self.proxy = data['proxy']
+        proxy_cfg = data['proxy']
+        if isinstance(proxy_cfg, list):
+            self.proxy_pool = proxy_cfg
+            self.proxy = None  # 每次 launch_browser 时从 pool 选取
+        else:
+            self.proxy_pool = [proxy_cfg] if proxy_cfg else []
+            self.proxy = proxy_cfg
+
+        capsolver_cfg = data.get('capsolver', {})
+        self.capsolver_enabled = capsolver_cfg.get('enabled', False)
+        self.capsolver_api_key = capsolver_cfg.get('api_key', '')
+
+        yescaptcha_cfg = data.get('yescaptcha', {})
+        self.yescaptcha_enabled = yescaptcha_cfg.get('enabled', False)
+        self.yescaptcha_api_key = yescaptcha_cfg.get('api_key', '')
 
         self.thread_local = threading.local()
         self.cleanup_lock = threading.Lock()
@@ -33,9 +47,16 @@ class BaseBrowserController(ABC):
     @abstractmethod
     def handle_captcha(self, page):
         """
-        验证码处理流程
+        验证码处理流程（按压型）
         """
         pass
+
+    def handle_image_captcha(self, page):
+        """
+        图片验证码处理流程（YesCaptcha FunCaptchaClassification）
+        子类可覆盖
+        """
+        return False
 
     @abstractmethod 
     def clean_up(self, page=None, type = "all_browser"):
@@ -71,23 +92,27 @@ class BaseBrowserController(ABC):
 
         return self.thread_local.browser
 
-    def outlook_register(self, page, email, password):
+    def outlook_register(self, page, email, password, firstname='', lastname=''):
 
         """
         通用逻辑:注册邮箱
         """
-        fake = Faker()
-
-        lastname = fake.last_name()
-        firstname = fake.first_name()
+        if not firstname:
+            from faker import Faker
+            fake = Faker()
+            firstname = fake.first_name()
+        if not lastname:
+            from faker import Faker
+            fake = Faker()
+            lastname = fake.last_name()
         year = str(random.randint(1960, 2005))
         month = str(random.randint(1, 12))
         day = str(random.randint(1, 28))
 
         try:
 
-            page.goto("https://outlook.live.com/mail/0/?prompt=create_account", timeout=20000, wait_until="domcontentloaded")
-            page.get_by_text('同意并继续').wait_for(timeout=30000)
+            page.goto("https://outlook.live.com/mail/0/?prompt=create_account", timeout=60000, wait_until="domcontentloaded")
+            page.get_by_text('同意并继续').wait_for(timeout=60000)
             start_time = time.time()
             page.wait_for_timeout(0.1 * self.wait_time)
             page.get_by_text('同意并继续').click(timeout=30000)
@@ -144,11 +169,14 @@ class BaseBrowserController(ABC):
                 return False
 
             if page.locator('iframe#enforcementFrame').count() > 0:
-                print("[Error: FunCaptcha] - 验证码类型错误，非按压验证码。 ")
-                return False
-            
-
-            captcha_result = self.handle_captcha(page)
+                if self.yescaptcha_enabled and self.yescaptcha_api_key:
+                    print("[Info] 检测到图片验证码，使用 YesCaptcha 识别...")
+                    captcha_result = self.handle_image_captcha(page)
+                else:
+                    print("[Error: FunCaptcha] - 验证码类型错误，非按压验证码。启用 yescaptcha 可自动识别。")
+                    return False
+            else:
+                captcha_result = self.handle_captcha(page)
 
             if not captcha_result:
                 raise TimeoutError
@@ -170,6 +198,23 @@ class BaseBrowserController(ABC):
             page.get_by_text('取消').click(timeout=20000)
 
         except:
+            # 截图诊断：看看注册后页面到底是什么
+            try:
+                page.screenshot(path='Results\\debug_after_captcha.png')
+                print(f"[Debug] 截图已保存到 Results/debug_after_captcha.png")
+                print(f"[Debug] 当前URL: {page.url}")
+                print(f"[Debug] 页面标题: {page.title()}")
+            except:
+                pass
+
+            # 尝试直接等待邮箱收件箱（跳过取消步骤）
+            try:
+                page.locator('[aria-label="新邮件"]').wait_for(timeout=20000)
+                print("[Info] 跳过取消步骤，直接进入邮箱。")
+                return True
+            except:
+                pass
+
             print(f"[Error: Timeout] - 无法找到按钮。")
             return False   
 

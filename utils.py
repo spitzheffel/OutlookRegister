@@ -2,18 +2,29 @@ import random
 import string
 import secrets
 
-def random_email(length=random.randint(12,14)):
+# 常见英文名
+FIRST_NAMES = [
+    'james', 'john', 'robert', 'michael', 'david', 'william', 'richard', 'joseph', 'thomas', 'charles',
+    'mary', 'patricia', 'jennifer', 'linda', 'elizabeth', 'barbara', 'susan', 'jessica', 'sarah', 'karen',
+    'daniel', 'matthew', 'anthony', 'mark', 'donald', 'steven', 'paul', 'andrew', 'joshua', 'kenneth',
+    'emily', 'emma', 'olivia', 'sophia', 'isabella', 'mia', 'charlotte', 'amelia', 'harper', 'evelyn',
+    'alex', 'ryan', 'kevin', 'brian', 'george', 'edward', 'henry', 'jason', 'adam', 'nathan',
+    'grace', 'lily', 'chloe', 'hannah', 'ella', 'madison', 'aria', 'luna', 'victoria', 'stella'
+]
 
-    first_char = random.choice(string.ascii_lowercase)
+LAST_NAMES = [
+    'smith', 'johnson', 'williams', 'brown', 'jones', 'garcia', 'miller', 'davis', 'rodriguez', 'martinez',
+    'wilson', 'anderson', 'taylor', 'thomas', 'moore', 'jackson', 'martin', 'lee', 'thompson', 'white',
+    'harris', 'clark', 'lewis', 'walker', 'hall', 'allen', 'young', 'king', 'wright', 'hill',
+    'scott', 'green', 'baker', 'adams', 'nelson', 'carter', 'mitchell', 'roberts', 'turner', 'phillips'
+]
 
-    other_chars = []
-    for _ in range(length - 1):  
-        if random.random() < 0.07:  
-            other_chars.append(random.choice(string.digits))
-        else: 
-            other_chars.append(random.choice(string.ascii_lowercase))
-
-    return first_char + ''.join(other_chars)
+def random_email():
+    first = random.choice(FIRST_NAMES)
+    last = random.choice(LAST_NAMES)
+    digits = ''.join(random.choices(string.digits, k=6))
+    email = f"{first}{last}{digits}"
+    return email, first.capitalize(), last.capitalize()
 
 def generate_strong_password(length=random.randint(11, 15)):
 

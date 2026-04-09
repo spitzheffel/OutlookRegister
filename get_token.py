@@ -7,7 +7,7 @@ import hashlib
 import secrets
 import requests
 from datetime import datetime
-from urllib.parse import quote, parse_qs
+from urllib.parse import quote, parse_qs, urlsplit
 
 def get_proxy():
     try:
@@ -30,13 +30,51 @@ def generate_code_challenge(code_verifier):
 
 def handle_oauth2_form(page,email):
     try:
+        # 等待登录页面加载完成
+        try:
+            page.locator('#loginHeader, #tilesHolder, [name="loginfmt"]').first.wait_for(timeout=15000)
+        except:
+            print("[OAuth2] 登录页面未加载")
+            page.screenshot(path='Results\\debug_oauth2.png')
+            return
 
-        page.locator('[name="loginfmt"]').fill(f'{email}@outlook.com',timeout=20000)
-        page.locator('#idSIButton9').click(timeout=7000)
-        page.locator('[data-testid="appConsentPrimaryButton"]').click(timeout=20000)
+        page.wait_for_timeout(1000)
 
-    except:
-        pass
+        # 优先：点击底部已登录的账号磁贴
+        try:
+            tile = page.locator(f'[data-test-id="{email}@outlook.com"]')
+            if tile.count() > 0:
+                print(f"[OAuth2] 点击已登录账号磁贴")
+                tile.click(timeout=5000)
+            else:
+                # 尝试包含邮箱地址的可点击元素
+                tile_alt = page.locator(f'div:has-text("{email}@outlook.com")').last
+                if tile_alt.count() > 0:
+                    print(f"[OAuth2] 点击包含邮箱的磁贴")
+                    tile_alt.click(timeout=5000)
+                else:
+                    # 回退：填写登录表单
+                    login_input = page.locator('[name="loginfmt"]')
+                    login_input.wait_for(timeout=5000)
+                    print("[OAuth2] 填写登录表单")
+                    login_input.fill(f'{email}@outlook.com', timeout=10000)
+                    page.locator('#idSIButton9').click(timeout=7000)
+        except Exception as e:
+            print(f"[OAuth2] 登录/选择账号异常: {e}")
+            page.screenshot(path='Results\\debug_oauth2_login.png')
+
+        # 等待并点击同意按钮
+        try:
+            consent_btn = page.locator('[data-testid="appConsentPrimaryButton"], #idBtn_Accept, [value="Accept"]')
+            consent_btn.first.wait_for(timeout=20000)
+            print("[OAuth2] 点击同意按钮")
+            consent_btn.first.click(timeout=7000)
+        except Exception as e:
+            print(f"[OAuth2] 同意按钮异常: {e}")
+            page.screenshot(path='Results\\debug_oauth2_consent.png')
+
+    except Exception as e:
+        print(f"[OAuth2] handle_oauth2_form 异常: {e}")
 
 def get_access_token(page, email):
 
@@ -60,36 +98,47 @@ def get_access_token(page, email):
         'code_challenge_method': 'S256'
     }
 
-    with page.expect_response(lambda response: redirect_url in response.url,timeout=50000) as response_info:
+    # 用事件监听器在请求发出时捕获 redirect URL（避免 localhost 无服务导致 chrome-error）
+    captured_code = {}
 
-        max_time = 2 
-        current_times = 0
-        while current_times < max_time:
+    def on_request(request):
+        if request.url.startswith(redirect_url) and 'code=' in request.url:
+            query = parse_qs(urlsplit(request.url).query)
+            if 'code' in query:
+                captured_code['code'] = query['code'][0]
 
-            try:
+    page.on('request', on_request)
 
-                page.wait_for_timeout(250)
-                url = f"https://login.microsoftonline.com/common/oauth2/v2.0/authorize?{'&'.join(f'{k}={quote(v)}' for k,v in params.items())}"
-                page.goto(url)
+    max_time = 2
+    current_times = 0
+    while current_times < max_time:
+        try:
+            page.wait_for_timeout(250)
+            url = f"https://login.microsoftonline.com/common/oauth2/v2.0/authorize?{'&'.join(f'{k}={quote(v)}' for k,v in params.items())}"
+            page.goto(url)
+            break
+        except:
+            current_times = current_times + 1
+            if current_times == max_time:
+                page.remove_listener('request', on_request)
+                return False, False, False
+            continue
 
-                break
+    handle_oauth2_form(page, email)
 
-            except:
-                    current_times = current_times + 1 
-                    if current_times == max_time:
-                        return False, False, False
-                    continue
-            
-        handle_oauth2_form(page, email)
+    # 等待 code 被捕获
+    for _ in range(120):  # 最多等 60 秒
+        if 'code' in captured_code:
+            break
+        page.wait_for_timeout(500)
 
-        response = response_info.value
-        callback_url = response.url
+    page.remove_listener('request', on_request)
 
-        if 'code=' not in callback_url:
+    if 'code' not in captured_code:
+        print(f"Authorization failed: No code captured. Current URL: {page.url}")
+        return False, False, False
 
-            print("Authorization failed: No code in callback URL")
-            return False, False, False
-        auth_code = parse_qs(callback_url.split('?')[1])['code'][0]
+    auth_code = captured_code['code']
 
     token_data = {
         'client_id': client_id,

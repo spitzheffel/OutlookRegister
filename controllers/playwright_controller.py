@@ -1,4 +1,6 @@
 import json
+import random
+from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 from .base_controller import BaseBrowserController
 
@@ -16,10 +18,18 @@ class PlaywrightController(BaseBrowserController):
         try:
             p = sync_playwright().start()
 
-            proxy_settings = {
-                "server": self.proxy,
-                "bypass": "localhost",
-            } if self.proxy else None
+            proxy_settings = None
+            proxy_url = random.choice(self.proxy_pool) if self.proxy_pool else self.proxy
+            if proxy_url:
+                parsed = urlparse(proxy_url)
+                proxy_settings = {
+                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                    "bypass": "localhost",
+                }
+                if parsed.username:
+                    proxy_settings["username"] = parsed.username
+                if parsed.password:
+                    proxy_settings["password"] = parsed.password
             b = p.chromium.launch(
                 executable_path=self.browser_path,
                 headless=False,            
