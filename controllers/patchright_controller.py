@@ -1,5 +1,6 @@
 import random
 import base64
+import time
 from urllib.parse import urlparse, parse_qs
 from patchright.sync_api import sync_playwright
 from .base_controller import BaseBrowserController
@@ -13,25 +14,31 @@ class PatchrightController(BaseBrowserController):
         try:
             p = sync_playwright().start() 
 
-            proxy_settings = None
             proxy_url = random.choice(self.proxy_pool) if self.proxy_pool else self.proxy
+            self._activate_proxy_fingerprint(proxy_url)
+            proxy_settings = self._build_browser_proxy_settings(proxy_url)
             if proxy_url:
                 parsed = urlparse(proxy_url)
-                proxy_settings = {
-                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
-                    "bypass": "localhost",
-                }
-                if parsed.username:
-                    proxy_settings["username"] = parsed.username
-                if parsed.password:
-                    proxy_settings["password"] = parsed.password
                 print(f"[Proxy] 使用代理: {parsed.hostname}:{parsed.port}")
 
-            b = p.chromium.launch(
-                headless=False,            
-                args=['--lang=zh-CN'],
-                proxy=proxy_settings
-            )
+            launch_args = self._build_launch_args()
+            if self.persistent_context:
+                profile_dir = self._create_profile_dir()
+                b = p.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    headless=False,
+                    args=launch_args,
+                    proxy=proxy_settings,
+                    **self._build_context_kwargs()
+                )
+                self._configure_context(b)
+                self._remember_context_profile(b, profile_dir)
+            else:
+                b = p.chromium.launch(
+                    headless=False,
+                    args=launch_args,
+                    proxy=proxy_settings
+                )
 
             return p, b
 
@@ -40,16 +47,235 @@ class PatchrightController(BaseBrowserController):
             return False, False
         
     def handle_captcha(self, page):
+        page.wait_for_timeout(1500)
+        if self._is_blocked(page):
+            print("[Error: IP or browser] - 当前IP注册频率过快。检查代理质量、出口地区与浏览器指纹。")
+            return False
 
-        if self.capsolver_enabled and self.capsolver_api_key:
-            return self._handle_captcha_capsolver(page)
-        return self._handle_captcha_click(page)
+        if self._has_hsprotect_challenge(page):
+            return self._handle_hsprotect_captcha(page)
+
+        if self._has_funcaptcha_challenge(page):
+            if self._is_image_funcaptcha(page):
+                if self.yescaptcha_enabled and self.yescaptcha_api_key:
+                    print("[Info] 检测到图片验证码，使用 YesCaptcha 识别...")
+                    return self.handle_image_captcha(page)
+                print("[Error: FunCaptcha] - 检测到图片验证码，但未启用 YesCaptcha。")
+                return False
+
+            if self.capsolver_enabled and self.capsolver_api_key:
+                return self._handle_captcha_capsolver(page)
+            return self._handle_captcha_click(page)
+
+        if self._is_blocked(page):
+            print("[Error: IP or browser] - 当前IP注册频率过快。检查代理质量、出口地区与浏览器指纹。")
+            return False
+
+        print("[Error: CAPTCHA] - 未识别到支持的验证码类型。")
+        return False
+
+    def _has_hsprotect_challenge(self, page):
+        """微软新的人机验证使用 hsprotect，而不是 Arkose/FunCaptcha。"""
+        try:
+            return any("hsprotect.net" in frame.url for frame in page.frames)
+        except:
+            return False
+
+    def _has_funcaptcha_challenge(self, page):
+        try:
+            return any(
+                "arkoselabs.com" in frame.url or "funcaptcha.com" in frame.url
+                for frame in page.frames
+            )
+        except:
+            return False
+
+    def _get_hsprotect_challenge_frame(self, page):
+        """找到真正承载“按住”按钮的内层 challenge frame。"""
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            for frame in page.frames:
+                try:
+                    if frame.url != "about:blank" and "hsprotect.net" not in frame.url:
+                        continue
+
+                    if self._get_hsprotect_hold_target(frame):
+                        return frame
+
+                    title = frame.evaluate("document.title || ''")
+                    text = frame.evaluate("(document.body && document.body.innerText || '').slice(0, 400)")
+                    if "Human Challenge" in title or "Human Challenge" in text:
+                        return frame
+                    if "按住" in text or "按住不放" in text:
+                        return frame
+                except:
+                    continue
+            page.wait_for_timeout(500)
+        return None
+
+    def _get_hsprotect_hold_target(self, frame):
+        selectors = [
+            '[role="button"][aria-label*="按住"]',
+            '[role="button"][aria-label*="Hold"]',
+            '[role="button"][aria-label*="Press and hold"]',
+            '[role="button"]:has-text("按住不放")',
+            '[role="button"]:has-text("按住")',
+            '[role="button"]:has-text("按住不放")',
+            '[role="button"]:has-text("Hold")',
+            '[role="button"]:has-text("Press and hold")',
+            '[aria-label*="人工挑战"]',
+            '[aria-label*="人工挑戰"]',
+            '[aria-label*="人类挑战"]',
+            '[aria-label*="人類挑戰"]',
+            '[aria-label*="Human Challenge"]',
+            '[aria-label*="可访问性挑战"]',
+            '[aria-label*="可存取性挑戰"]',
+            '[aria-label*="可訪問性挑戰"]',
+        ]
+        for sel in selectors:
+            loc = frame.locator(sel).first
+            try:
+                if loc.count() > 0:
+                    return loc
+            except:
+                continue
+        return None
+
+    def _handle_hsprotect_captcha(self, page):
+        """兼容微软当前 hsprotect 按住型验证码。"""
+        try:
+            page.wait_for_event(
+                "request",
+                lambda req: req.url.startswith("blob:https://iframe.hsprotect.net/"),
+                timeout=5000
+            )
+        except:
+            pass
+
+        page.wait_for_timeout(800)
+
+        for _ in range(0, self.max_captcha_retries + 1):
+            frame = self._get_hsprotect_challenge_frame(page)
+            if not frame:
+                return False
+
+            target = self._get_hsprotect_hold_target(frame)
+            if not target:
+                return False
+
+            try:
+                target.focus(timeout=3000)
+            except:
+                pass
+
+            try:
+                target.press("Enter", timeout=3000)
+            except:
+                page.keyboard.press("Enter")
+            page.wait_for_timeout(11500)
+            try:
+                target.press("Enter", timeout=3000)
+            except:
+                page.keyboard.press("Enter")
+
+            try:
+                page.wait_for_event(
+                    "request",
+                    lambda req: req.url.startswith("https://browser.events.data.microsoft.com"),
+                    timeout=8000
+                )
+                try:
+                    page.wait_for_event(
+                        "request",
+                        lambda req: "hsprotect.net/assets/js/bundle" in req.url,
+                        timeout=1700
+                    )
+                    page.wait_for_timeout(2000)
+                    continue
+                except:
+                    if self._is_blocked(page):
+                        print("[Error: Rate limit] - 正常通过验证码，但当前IP注册频率过快。")
+                        return False
+                    return True
+
+            except:
+                page.wait_for_timeout(5000)
+                try:
+                    target.focus(timeout=3000)
+                except:
+                    pass
+
+                try:
+                    target.press("Enter", timeout=3000)
+                except:
+                    page.keyboard.press("Enter")
+                try:
+                    page.wait_for_event(
+                        "request",
+                        lambda req: req.url.startswith("https://browser.events.data.microsoft.com"),
+                        timeout=10000
+                    )
+                except:
+                    continue
+
+                try:
+                    page.wait_for_event(
+                        "request",
+                        lambda req: "hsprotect.net/assets/js/bundle" in req.url,
+                        timeout=4000
+                    )
+                    page.wait_for_timeout(500)
+                    continue
+                except:
+                    if self._is_blocked(page):
+                        print("[Error: Rate limit] - 正常通过验证码，但当前IP注册频率过快。")
+                        return False
+                    return True
+
+        return False
+
+    def _is_image_funcaptcha(self, page):
+        """仅在真正出现图片题时才走 YesCaptcha。"""
+        challenge_frame = self._get_funcaptcha_frame(page)
+        if not challenge_frame:
+            return False
+
+        image_selectors = [
+            'canvas',
+            '[class*="game-image"]',
+            '[class*="challenge-image"]',
+            'img[class*="challenge"]',
+            '.fc-image-grid',
+            '[class*="image-container"]',
+        ]
+        for sel in image_selectors:
+            try:
+                if challenge_frame.locator(sel).count() > 0:
+                    return True
+            except:
+                continue
+        return False
+
+    def _get_funcaptcha_frame(self, page):
+        for frame in page.frames:
+            try:
+                if 'arkoselabs.com' in frame.url or 'funcaptcha.com' in frame.url:
+                    return frame
+            except:
+                continue
+        return None
+
+    def _get_captcha_frames(self, page):
+        """通过 URL 匹配获取验证码 iframe，避免依赖 title 属性（跨语言不稳定）"""
+        # 外层: Arkose/FunCaptcha enforcement frame
+        frame1 = page.frame_locator('iframe#enforcementFrame, iframe[title="验证质询"], iframe[src*="arkoselabs"], iframe[src*="funcaptcha"]')
+        # 内层: 实际 challenge frame
+        frame2 = frame1.frame_locator('iframe[style*="display: block"], iframe[id*="fc-iframe"]')
+        return frame1, frame2
 
     def _extract_arkose_public_key(self, page):
         """从 enforcement iframe 的 URL 中提取 Arkose Labs 公钥"""
         try:
-            enforcement_frame = page.frame_locator('iframe[title="验证质询"]')
-            inner_frame = enforcement_frame.frame_locator('iframe[style*="display: block"]')
             # 尝试从 iframe src 获取 public key
             for frame in page.frames:
                 if 'arkoselabs.com' in frame.url or 'funcaptcha.com' in frame.url:
@@ -137,18 +363,17 @@ class PatchrightController(BaseBrowserController):
             # 等待验证结果
             page.wait_for_timeout(5000)
 
-            if page.get_by_text('一些异常活动').count() or page.get_by_text('此站点正在维护，暂时无法使用，请稍后重试。').count() > 0:
+            if self._is_blocked(page):
                 print("[Error: Rate limit] - CapSolver 通过验证码，但 IP 频率过快。")
                 return False
 
-            if page.get_by_text('取消').count() > 0:
+            if page.locator('[data-testid="secondaryButton"]').count() > 0:
                 return True
 
             # 检查验证码是否还在
             try:
-                frame1 = page.frame_locator('iframe[title="验证质询"]')
-                frame2 = frame1.frame_locator('iframe[style*="display: block"]')
-                if frame2.locator('[aria-label="可访问性挑战"]').count() > 0:
+                frame1, frame2 = self._get_captcha_frames(page)
+                if frame2.locator('#game_children_challenge, button[data-action="game"]').count() > 0:
                     print("[CapSolver] Token 注入后验证码仍在，回退到点击方式")
                     return self._handle_captcha_click(page)
             except:
@@ -162,20 +387,19 @@ class PatchrightController(BaseBrowserController):
 
     def _handle_captcha_click(self, page):
         """原始的按钮点击方式处理验证码"""
-        frame1 = page.frame_locator('iframe[title="验证质询"]')
-        frame2 = frame1.frame_locator('iframe[style*="display: block"]')
+        frame1, frame2 = self._get_captcha_frames(page)
 
 
         for _ in range(0, self.max_captcha_retries + 1):
 
             page.wait_for_timeout(200)
-            loc = frame2.locator('[aria-label="可访问性挑战"]')
+            loc = frame2.locator('#game_children_challenge, button[data-action="game"]').first
             box = loc.bounding_box()
             x = box['x'] + box['width'] / 2 + random.randint(-10, 10)
             y = box['y'] + box['height'] / 2 + random.randint(-10, 10)
             page.mouse.click(x, y)
 
-            loc2 = frame2.locator('[aria-label="再次按下"]')
+            loc2 = frame2.locator('#wrong_children_challenge, button[data-action="wrong"]').first
             box2 = loc2.bounding_box()
             x = box2['x'] + box2['width'] / 2 + random.randint(-20, 20)
             y = box2['y'] + box2['height'] / 2 + random.randint(-13, 13)
@@ -187,24 +411,24 @@ class PatchrightController(BaseBrowserController):
                 try:
 
                     # 简单的认为加载8秒后成功，暂不考虑请求.
-                    page.locator('[role="status"][aria-label="正在加载..."]').wait_for(timeout=5000)
+                    page.locator('[role="status"]').wait_for(timeout=5000)
                     page.wait_for_timeout(8000)
-                    if page.get_by_text('一些异常活动').count() or page.get_by_text('此站点正在维护，暂时无法使用，请稍后重试。').count() > 0:
+                    if self._is_blocked(page):
                         print("[Error: Rate limit] - 正常通过验证码，但当前IP注册频率过快。")
                         return False
-                    elif frame2.locator('[aria-label="可访问性挑战"]').count() > 0:
+                    elif frame2.locator('#game_children_challenge, button[data-action="game"]').count() > 0:
                         continue
                     break
 
                 except:
 
-                    if page.get_by_text('取消').count() > 0:
+                    if page.locator('[data-testid="secondaryButton"]').count() > 0:
                         break
-                    frame1.get_by_text("请再试一次").wait_for(timeout=15000)
+                    frame1.locator('.error-text, [class*="retry"], [class*="error"]').first.wait_for(timeout=15000)
                     continue
 
             except:
-                if page.get_by_text('取消').count() > 0:
+                if page.locator('[data-testid="secondaryButton"]').count() > 0:
                      break
                 return False
         else: 
@@ -218,14 +442,7 @@ class PatchrightController(BaseBrowserController):
 
         try:
             page.wait_for_timeout(2000)
-            enforcement = page.frame_locator('iframe#enforcementFrame')
-
-            # 找到 arkoselabs 的 challenge iframe
-            challenge_frame = None
-            for frame in page.frames:
-                if 'arkoselabs.com' in frame.url or 'funcaptcha.com' in frame.url:
-                    challenge_frame = frame
-                    break
+            challenge_frame = self._get_funcaptcha_frame(page)
 
             if not challenge_frame:
                 print("[YesCaptcha] 未找到验证码 iframe")
@@ -262,11 +479,11 @@ class PatchrightController(BaseBrowserController):
                 page.wait_for_timeout(3000)
 
                 # 检查是否通过
-                if page.get_by_text('一些异常活动').count() or page.get_by_text('此站点正在维护，暂时无法使用，请稍后重试。').count() > 0:
+                if self._is_blocked(page):
                     print("[Error: Rate limit] - 通过验证码，但当前IP注册频率过快。")
                     return False
 
-                if page.get_by_text('取消').count() > 0:
+                if page.locator('[data-testid="secondaryButton"]').count() > 0:
                     print(f"[YesCaptcha] 验证码已通过（{round_idx+1}轮）")
                     return True
 
@@ -393,19 +610,23 @@ class PatchrightController(BaseBrowserController):
 
     def get_thread_page(self):
         browser = self.get_thread_browser()
-        context = browser.new_context()
+        if hasattr(browser, "new_context"):
+            context = browser.new_context(**self._build_context_kwargs())
+            self._configure_context(context)
+        else:
+            context = browser
         return context.new_page()
 
     def clean_up(self, page=None, type="all_browser"):
         if type == "done_browser" and page:
-            context = page.context
-            context.close()
+            self._release_thread_browser(page)
 
         elif type == "all_browser":
             for p, b in self.active_resources:
                 try:
                     b.close()
                 except Exception: pass
+                self._cleanup_context_profile(b)
                 try:
                     p.stop()
                 except Exception: pass

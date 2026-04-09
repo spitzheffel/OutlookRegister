@@ -2,8 +2,13 @@ import time
 import json
 import random
 import threading
+import os
+import shutil
+import tempfile
+from urllib.parse import urlparse
 from faker import Faker
 from abc import ABC, abstractmethod
+from utils import detect_proxy_geo
 
 class BaseBrowserController(ABC):
     """
@@ -35,6 +40,383 @@ class BaseBrowserController(ABC):
         self.thread_local = threading.local()
         self.cleanup_lock = threading.Lock()
         self.active_resources = []  # 记录资源以便关闭
+        self.context_profile_dirs = {}
+        self.configured_contexts = set()
+
+        # 检测代理出口 IP 地理位置，用于浏览器指纹一致性
+        sample_proxy = self.proxy_pool[0] if self.proxy_pool else self.proxy
+        self.default_geo_info = detect_proxy_geo(sample_proxy)
+
+        fingerprint_cfg = data.get("fingerprint", {})
+        self.persistent_context = fingerprint_cfg.get("persistent_context", True)
+        self.cleanup_profile = fingerprint_cfg.get("cleanup_profile", True)
+        self.disable_webrtc = fingerprint_cfg.get("disable_webrtc", True)
+        self.grant_geolocation = fingerprint_cfg.get("grant_geolocation", False)
+        self.force_remote_dns = fingerprint_cfg.get("force_remote_dns", True)
+        self.host_resolver_excludes = fingerprint_cfg.get(
+            "host_resolver_excludes",
+            ["localhost", "127.0.0.1", "::1"]
+        )
+        self.profile_root = fingerprint_cfg.get("profile_root", os.path.join("Results", "browser_profiles"))
+        viewport_cfg = fingerprint_cfg.get("viewport", {})
+        screen_cfg = fingerprint_cfg.get("screen", {})
+        self.viewport = {
+            "width": int(viewport_cfg.get("width", 1280)),
+            "height": int(viewport_cfg.get("height", 720)),
+        }
+        self.screen = {
+            "width": int(screen_cfg.get("width", self.viewport["width"])),
+            "height": int(screen_cfg.get("height", self.viewport["height"])),
+        }
+        self.default_fingerprint_state = self._build_fingerprint_state(self.default_geo_info)
+        self.geo_info = self.default_fingerprint_state["geo_info"]
+        self.language_list = self.default_fingerprint_state["language_list"]
+        self.accept_language = self.default_fingerprint_state["accept_language"]
+
+    def _is_blocked(self, page):
+        """检测页面是否显示 IP 被封/异常活动/维护中等拦截信息"""
+        if page.locator('#error_desc, [data-testid="errorDescription"]').count() > 0:
+            return True
+
+        try:
+            title = page.title()
+            blocked_titles = (
+                "已封鎖建立帳戶",
+                "已封锁建立帐户",
+                "已封锁创建帐户",
+                "Blocked from creating an account",
+            )
+            if any(marker in title for marker in blocked_titles):
+                return True
+        except:
+            pass
+
+        try:
+            body_text = page.locator("body").inner_text(timeout=1000)
+            blocked_markers = (
+                "一些异常活动",
+                "一些異常活動",
+                "已封鎖建立帳戶",
+                "已封锁建立帐户",
+                "已封锁创建帐户",
+                "此站点正在维护",
+                "此網站正在維護",
+                "Blocked from creating an account",
+                "temporarily unavailable",
+            )
+            if any(marker in body_text for marker in blocked_markers):
+                return True
+        except:
+            pass
+
+        return False
+
+    def _build_language_list(self, locale):
+        values = [locale]
+        if locale == "zh-HK":
+            values.extend(["zh-TW", "zh", "en-US", "en"])
+        elif locale == "zh-TW":
+            values.extend(["zh-HK", "zh", "en-US", "en"])
+        elif locale == "zh-CN":
+            values.extend(["zh", "en-US", "en"])
+        else:
+            base_lang = locale.split("-")[0]
+            values.extend([base_lang, "en-US", "en"])
+
+        seen = set()
+        result = []
+        for item in values:
+            if item and item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
+
+    def _build_accept_language(self, languages):
+        parts = []
+        for idx, language in enumerate(languages):
+            if idx == 0:
+                parts.append(language)
+            else:
+                quality = max(0.1, 1 - idx * 0.1)
+                parts.append(f"{language};q={quality:.1f}")
+        return ",".join(parts)
+
+    def _build_fingerprint_state(self, geo_info):
+        locale = geo_info["locale"] if geo_info else "en-US"
+        language_list = self._build_language_list(locale)
+        return {
+            "geo_info": geo_info,
+            "language_list": language_list,
+            "accept_language": self._build_accept_language(language_list),
+        }
+
+    def _get_fingerprint_state(self):
+        return getattr(self.thread_local, "fingerprint_state", None) or self.default_fingerprint_state
+
+    def _activate_proxy_fingerprint(self, proxy_url=None):
+        geo_info = detect_proxy_geo(proxy_url)
+        if not geo_info:
+            geo_info = self.default_fingerprint_state["geo_info"]
+
+        state = self._build_fingerprint_state(geo_info)
+        self.thread_local.proxy_url = proxy_url
+        self.thread_local.fingerprint_state = state
+        return state
+
+    def _build_browser_proxy_settings(self, proxy_url):
+        if not proxy_url:
+            self.thread_local.proxy_server_host = None
+            self.thread_local.proxy_server_scheme = None
+            return None
+
+        parsed = urlparse(proxy_url)
+        if not parsed.hostname or not parsed.port:
+            raise ValueError(f"代理格式错误: {proxy_url}")
+
+        raw_scheme = (parsed.scheme or "").lower()
+        browser_scheme = "socks5" if raw_scheme == "socks5h" else raw_scheme
+        proxy_settings = {
+            "server": f"{browser_scheme}://{parsed.hostname}:{parsed.port}",
+            "bypass": "localhost",
+        }
+        if parsed.username:
+            proxy_settings["username"] = parsed.username
+        if parsed.password:
+            proxy_settings["password"] = parsed.password
+
+        self.thread_local.proxy_server_host = parsed.hostname
+        self.thread_local.proxy_server_scheme = raw_scheme
+        return proxy_settings
+
+    def _build_host_resolver_rules(self):
+        if not self.force_remote_dns:
+            return None
+
+        proxy_url = getattr(self.thread_local, "proxy_url", None)
+        proxy_host = getattr(self.thread_local, "proxy_server_host", None)
+        if not proxy_url or not proxy_host:
+            return None
+
+        excluded_hosts = []
+        for host in [*self.host_resolver_excludes, proxy_host]:
+            if host and host not in excluded_hosts:
+                excluded_hosts.append(host)
+
+        rules = ["MAP * ~NOTFOUND"]
+        rules.extend(f"EXCLUDE {host}" for host in excluded_hosts)
+        return " , ".join(rules)
+
+    def _build_context_kwargs(self):
+        state = self._get_fingerprint_state()
+        geo_info = state["geo_info"]
+        ctx_kwargs = {
+            "viewport": self.viewport,
+            "screen": self.screen,
+            "locale": geo_info["locale"] if geo_info else "en-US",
+        }
+        if geo_info:
+            ctx_kwargs["timezone_id"] = geo_info["timezone"]
+            ctx_kwargs["geolocation"] = {
+                "latitude": geo_info["latitude"],
+                "longitude": geo_info["longitude"],
+            }
+        return ctx_kwargs
+
+    def _build_launch_args(self):
+        state = self._get_fingerprint_state()
+        geo_info = state["geo_info"]
+        lang = geo_info["lang"] if geo_info else "en-US"
+        args = [f"--lang={lang}"]
+        if self.disable_webrtc:
+            args.extend([
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "--enforce-webrtc-ip-permission-check",
+            ])
+        host_resolver_rules = self._build_host_resolver_rules()
+        if host_resolver_rules:
+            args.append(f"--host-resolver-rules={host_resolver_rules}")
+        return args
+
+    def _create_profile_dir(self):
+        if not self.persistent_context:
+            return None
+        os.makedirs(self.profile_root, exist_ok=True)
+        return tempfile.mkdtemp(prefix="profile-", dir=self.profile_root)
+
+    def _remember_context_profile(self, context, profile_dir):
+        if profile_dir:
+            self.context_profile_dirs[id(context)] = profile_dir
+
+    def _cleanup_context_profile(self, context):
+        self.configured_contexts.discard(id(context))
+        profile_dir = self.context_profile_dirs.pop(id(context), None)
+        if profile_dir and self.cleanup_profile:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+
+    def _clear_thread_runtime(self):
+        for attr in (
+            "browser",
+            "playwright",
+            "fingerprint_state",
+            "proxy_url",
+            "proxy_server_host",
+            "proxy_server_scheme",
+        ):
+            if hasattr(self.thread_local, attr):
+                delattr(self.thread_local, attr)
+
+    def _release_thread_browser(self, page=None):
+        browser = getattr(self.thread_local, "browser", None)
+        playwright = getattr(self.thread_local, "playwright", None)
+        context = page.context if page else None
+
+        if context and context is not browser:
+            try:
+                context.close()
+            except Exception:
+                pass
+            self._cleanup_context_profile(context)
+
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            self._cleanup_context_profile(browser)
+
+        if playwright:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+        if browser:
+            with self.cleanup_lock:
+                self.active_resources = [
+                    (p, b) for p, b in self.active_resources
+                    if b is not browser
+                ]
+
+        self._clear_thread_runtime()
+
+    def _configure_context(self, context):
+        context_id = id(context)
+        if context_id in self.configured_contexts:
+            return
+
+        state = self._get_fingerprint_state()
+        geo_info = state["geo_info"]
+        language_list = state["language_list"]
+        accept_language = state["accept_language"]
+
+        context.set_extra_http_headers({
+            "Accept-Language": accept_language,
+        })
+
+        languages_json = json.dumps(language_list, ensure_ascii=False)
+        primary_language = json.dumps(language_list[0], ensure_ascii=False)
+        context.add_init_script(f"""
+            (() => {{
+                const languages = {languages_json};
+                const primaryLanguage = {primary_language};
+                const define = (proto, key, getter) => {{
+                    try {{
+                        Object.defineProperty(proto, key, {{
+                            get: getter,
+                            configurable: true
+                        }});
+                    }} catch (e) {{
+                    }}
+                }};
+
+                define(Navigator.prototype, 'language', () => primaryLanguage);
+                define(Navigator.prototype, 'languages', () => languages.slice());
+            }})();
+        """)
+
+        if self.grant_geolocation and geo_info:
+            context.grant_permissions(["geolocation"])
+
+        self.configured_contexts.add(context_id)
+
+    def _select_fluent_dropdown(self, page, trigger_selector, option_index):
+        """
+        选择 Fluent UI combobox 中的第 N 个选项。
+        微软注册页会把多个隐藏 dropdown 同时挂在 DOM 上，所以这里显式取可见 listbox。
+        """
+        trigger = page.locator(trigger_selector).first
+        trigger.wait_for(state="attached", timeout=10000)
+
+        try:
+            tag_name = trigger.evaluate("el => el.tagName.toLowerCase()")
+        except:
+            tag_name = ""
+
+        if tag_name == "select":
+            try:
+                trigger.select_option(value=str(option_index), timeout=5000)
+                return
+            except:
+                trigger.select_option(index=option_index - 1, timeout=5000)
+                return
+
+        visible_listbox = page.locator('[role="listbox"]:visible').last
+
+        def try_click_option():
+            visible_listbox.wait_for(state="visible", timeout=1200)
+            visible_listbox.locator('[role="option"]').nth(option_index - 1).click(timeout=5000)
+
+        try:
+            trigger.click(timeout=5000)
+            try_click_option()
+            return
+        except:
+            pass
+
+        try:
+            trigger.focus(timeout=3000)
+        except:
+            pass
+
+        for open_key in ("Alt+ArrowDown", "Space", "Enter"):
+            try:
+                page.keyboard.press(open_key)
+                page.wait_for_timeout(150)
+                try:
+                    try_click_option()
+                    return
+                except:
+                    pass
+            except:
+                continue
+
+        # 最后的兜底：直接通过键盘移动到目标选项并确认。
+        try:
+            trigger.focus(timeout=3000)
+        except:
+            pass
+
+        try:
+            page.keyboard.press("Home")
+            page.wait_for_timeout(100)
+        except:
+            pass
+
+        for _ in range(max(option_index - 1, 0)):
+            page.keyboard.press("ArrowDown")
+            page.wait_for_timeout(40)
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(250)
+
+        current_text = ""
+        try:
+            current_text = (trigger.text_content(timeout=1000) or "").strip()
+        except:
+            pass
+
+        if not current_text:
+            raise TimeoutError(f"下拉框未成功选择选项: {trigger_selector} -> {option_index}")
 
 
     @abstractmethod
@@ -112,10 +494,10 @@ class BaseBrowserController(ABC):
         try:
 
             page.goto("https://outlook.live.com/mail/0/?prompt=create_account", timeout=60000, wait_until="domcontentloaded")
-            page.get_by_text('同意并继续').wait_for(timeout=60000)
+            page.locator('[data-testid="primaryButton"]').first.wait_for(timeout=60000)
             start_time = time.time()
             page.wait_for_timeout(0.1 * self.wait_time)
-            page.get_by_text('同意并继续').click(timeout=30000)
+            page.locator('[data-testid="primaryButton"]').first.click(timeout=30000)
 
         except: 
 
@@ -124,7 +506,7 @@ class BaseBrowserController(ABC):
         
         try:
 
-            page.locator('[aria-label="新建电子邮件"]').type(email,delay=0.006 * self.wait_time,timeout=10000)
+            page.locator('input[name="email"]').first.type(email,delay=0.006 * self.wait_time,timeout=10000)
             page.locator('[data-testid="primaryButton"]').click(timeout=5000)
             page.wait_for_timeout(0.02 * self.wait_time)
             page.locator('[type="password"]').type(password,delay=0.004 * self.wait_time, timeout=10000)
@@ -134,23 +516,12 @@ class BaseBrowserController(ABC):
             page.wait_for_timeout(0.03 * self.wait_time)
             page.locator('[name="BirthYear"]').fill(year,timeout=10000)
 
-            try:
+            # 月份和日期现在是 combobox（Fluent UI Dropdown），不再是原生 <select>
+            self._select_fluent_dropdown(page, '#BirthMonthDropdown, [name="BirthMonth"]', int(month))
+            page.wait_for_timeout(0.04 * self.wait_time)
+            self._select_fluent_dropdown(page, '#BirthDayDropdown, [name="BirthDay"]', int(day))
 
-                page.wait_for_timeout(0.02 * self.wait_time)
-                page.locator('[name="BirthMonth"]').select_option(value=month,timeout=1000)
-                page.wait_for_timeout(0.05 * self.wait_time)
-                page.locator('[name="BirthDay"]').select_option(value=day)
-            
-            except:
-
-                page.locator('[name="BirthMonth"]').click()
-                page.wait_for_timeout(0.02 * self.wait_time)
-                page.locator(f'[role="option"]:text-is("{month}月")').click()
-                page.wait_for_timeout(0.04 * self.wait_time)
-                page.locator('[name="BirthDay"]').click()
-                page.wait_for_timeout(0.03 * self.wait_time)
-                page.locator(f'[role="option"]:text-is("{day}日")').click()
-                page.locator('[data-testid="primaryButton"]').click(timeout=5000)
+            page.locator('[data-testid="primaryButton"]').click(timeout=5000)
 
             page.locator('#lastNameInput').type(lastname,delay=0.002 * self.wait_time,timeout=10000)
             page.wait_for_timeout(0.02 * self.wait_time)
@@ -164,19 +535,11 @@ class BaseBrowserController(ABC):
 
             page.wait_for_timeout(400)
 
-            if page.get_by_text('一些异常活动').count() or page.get_by_text('此站点正在维护，暂时无法使用，请稍后重试。').count() > 0:
+            if self._is_blocked(page):
                 print("[Error: IP or browser] - 当前IP注册频率过快。检查IP与是否为指纹浏览器并关闭了无头模式。")
                 return False
 
-            if page.locator('iframe#enforcementFrame').count() > 0:
-                if self.yescaptcha_enabled and self.yescaptcha_api_key:
-                    print("[Info] 检测到图片验证码，使用 YesCaptcha 识别...")
-                    captcha_result = self.handle_image_captcha(page)
-                else:
-                    print("[Error: FunCaptcha] - 验证码类型错误，非按压验证码。启用 yescaptcha 可自动识别。")
-                    return False
-            else:
-                captcha_result = self.handle_captcha(page)
+            captcha_result = self.handle_captcha(page)
 
             if not captcha_result:
                 raise TimeoutError
@@ -195,7 +558,7 @@ class BaseBrowserController(ABC):
             return True
         
         try:
-            page.get_by_text('取消').click(timeout=20000)
+            page.locator('[data-testid="secondaryButton"], [data-testid="cancelButton"], #declineButton').first.click(timeout=20000)
 
         except:
             # 截图诊断：看看注册后页面到底是什么
@@ -209,7 +572,7 @@ class BaseBrowserController(ABC):
 
             # 尝试直接等待邮箱收件箱（跳过取消步骤）
             try:
-                page.locator('[aria-label="新邮件"]').wait_for(timeout=20000)
+                page.locator('[data-testid="ComposeMail"], [data-testid="newMessageButton"], button[class*="compose"]').first.wait_for(timeout=20000)
                 print("[Info] 跳过取消步骤，直接进入邮箱。")
                 return True
             except:
@@ -221,14 +584,14 @@ class BaseBrowserController(ABC):
         try:
 
             try:
-                # 这个不确定是不是一定出现
-                page.get_by_text('无法创建通行密钥').wait_for(timeout=25000)
-                page.get_by_text('取消').click(timeout=7000)
+                # passkey 弹窗，不一定出现
+                page.locator('[data-testid="passkey-error"], [data-testid="errorDescription"]').first.wait_for(timeout=25000)
+                page.locator('[data-testid="secondaryButton"], [data-testid="cancelButton"], #declineButton').first.click(timeout=7000)
 
             except:
                 pass
 
-            page.locator('[aria-label="新邮件"]').wait_for(timeout=26000)
+            page.locator('[data-testid="ComposeMail"], [data-testid="newMessageButton"], button[class*="compose"]').first.wait_for(timeout=26000)
             return True
 
         except:

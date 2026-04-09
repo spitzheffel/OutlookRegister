@@ -18,24 +18,31 @@ class PlaywrightController(BaseBrowserController):
         try:
             p = sync_playwright().start()
 
-            proxy_settings = None
             proxy_url = random.choice(self.proxy_pool) if self.proxy_pool else self.proxy
+            self._activate_proxy_fingerprint(proxy_url)
+            proxy_settings = self._build_browser_proxy_settings(proxy_url)
             if proxy_url:
                 parsed = urlparse(proxy_url)
-                proxy_settings = {
-                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
-                    "bypass": "localhost",
-                }
-                if parsed.username:
-                    proxy_settings["username"] = parsed.username
-                if parsed.password:
-                    proxy_settings["password"] = parsed.password
-            b = p.chromium.launch(
-                executable_path=self.browser_path,
-                headless=False,            
-                args=['--lang=zh-CN'],
-                proxy=proxy_settings
-            )
+                print(f"[Proxy] 使用代理: {parsed.hostname}:{parsed.port}")
+            launch_kwargs = {
+                "headless": False,
+                "args": self._build_launch_args(),
+                "proxy": proxy_settings,
+            }
+            if self.browser_path:
+                launch_kwargs["executable_path"] = self.browser_path
+
+            if self.persistent_context:
+                profile_dir = self._create_profile_dir()
+                b = p.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    **launch_kwargs,
+                    **self._build_context_kwargs()
+                )
+                self._configure_context(b)
+                self._remember_context_profile(b, profile_dir)
+            else:
+                b = p.chromium.launch(**launch_kwargs)
 
             return p, b
 
@@ -45,7 +52,11 @@ class PlaywrightController(BaseBrowserController):
 
     def get_thread_page(self):
         browser = self.get_thread_browser()
-        context = browser.new_context()
+        if hasattr(browser, "new_context"):
+            context = browser.new_context(**self._build_context_kwargs())
+            self._configure_context(context)
+        else:
+            context = browser
         return context.new_page()
     
     def handle_captcha(self, page):
@@ -67,7 +78,7 @@ class PlaywrightController(BaseBrowserController):
                     continue
 
                 except:
-                    if page.get_by_text('一些异常活动').count() or page.get_by_text('此站点正在维护，暂时无法使用，请稍后重试。').count() > 0:
+                    if self._is_blocked(page):
                         print("[Error: Rate limit] - 正常通过验证码，但当前IP注册频率过快。")
                         return False
                     break
@@ -92,14 +103,14 @@ class PlaywrightController(BaseBrowserController):
     def clean_up(self, page=None, type="all_browser"):
 
         if type == "done_browser" and page:
-            context = page.context
-            context.close()
+            self._release_thread_browser(page)
 
         elif type == "all_browser":
             for p, b in self.active_resources:
                 try:
                     b.close()
                 except Exception: pass
+                self._cleanup_context_profile(b)
                 try:
                     p.stop()
                 except Exception: pass
